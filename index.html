@@ -657,6 +657,33 @@ td select, td .cdd-btn {
   transition: opacity .4s ease;
 }
 
+
+/* Portal separation */
+.portal-badge {
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:10px; font-weight:800; letter-spacing:.06em; text-transform:uppercase;
+  padding:4px 10px; border-radius:999px; margin-left:6px;
+}
+.portal-badge.public { background:rgba(16,185,129,.15); color:#059669; }
+.portal-badge.owner { background:rgba(79,70,229,.15); color:#4f46e5; }
+[data-theme="dark"] .portal-badge.public { color:#34d399; }
+[data-theme="dark"] .portal-badge.owner { color:#a5b4fc; }
+.share-box {
+  margin-top:12px; padding:12px 14px; border-radius:14px;
+  border:1px dashed var(--line); background:var(--soft); font-size:13px;
+}
+.share-box code {
+  display:block; margin-top:6px; padding:8px 10px; border-radius:10px;
+  background:var(--card); border:1px solid var(--line);
+  word-break:break-all; font-size:12px; user-select:all;
+}
+.share-box .row { margin-top:8px; gap:8px; flex-wrap:wrap; }
+.device-note {
+  margin-top:10px; padding:10px 12px; border-radius:12px;
+  background:rgba(245,158,11,.12); border:1px solid rgba(245,158,11,.35);
+  color:var(--ink); font-size:12px; line-height:1.45;
+}
+
 </style>
 </head>
 <body>
@@ -852,7 +879,7 @@ td select, td .cdd-btn {
       </div>
     </div>
     <div class="top-actions">
-      <button type="button" class="public-btn" id="publicBtn" onclick="goPublic()" title="Back to public site">🌐 Public</button>
+      <button type="button" class="public-btn" id="publicBtn" onclick="goPublic()" title="Open customer (public) site">🌐 Customer site</button>
       <button type="button" class="theme-btn" id="themeBtn" onclick="toggleTheme()" title="Toggle theme">🌙 Dark</button>
     </div>
   </header>
@@ -1329,14 +1356,73 @@ function resetDraft(){
 function emptyItem(n){ return {id:uid(), label:"Job "+n, files:[], links:[], pages:1, colorMode:"color", paperSize:"A4", media:"plain", coverage:"medium", coveragePct:null, sides:"simplex", copies:1, notes:"", inkOverridePerPage:null}; }
 function isOwnerAuthed(){ return !!(S.ownerSession && S.ownerSession.loggedIn); }
 function isAdminRoute(name){ return String(name||"").startsWith("admin"); }
+
+/** portal: "public" = customer site only | "owner" = private console (+ can open public) */
+let portal = "public";
+
+function publicBaseUrl(){
+  // Shareable customer link (no #owner)
+  try {
+    const u = new URL(location.href);
+    u.hash = "";
+    u.search = "";
+    let s = u.toString();
+    if(s.endsWith("#")) s = s.slice(0,-1);
+    return s;
+  } catch(e){ return location.href.split("#")[0]; }
+}
+function ownerBaseUrl(){
+  const base = publicBaseUrl();
+  return base + (base.endsWith("/") ? "" : "/") + "#owner";
+}
+function readPortalFromLocation(){
+  const h = (location.hash || "").replace(/^#/, "").toLowerCase();
+  // #owner | #/owner | #owner/orders etc.
+  if(h === "owner" || h.startsWith("owner/") || h.startsWith("/owner")) return "owner";
+  return "public";
+}
+function setPortal(mode, opts){
+  opts = opts || {};
+  portal = (mode === "owner") ? "owner" : "public";
+  try {
+    if(portal === "owner"){
+      if((location.hash || "").replace(/^#/,"").toLowerCase().indexOf("owner") !== 0){
+        history.replaceState(null, "", location.pathname + location.search + "#owner");
+      }
+    } else if(!opts.keepHash){
+      if((location.hash || "").toLowerCase().indexOf("owner") >= 0){
+        history.replaceState(null, "", location.pathname + location.search);
+      }
+    }
+  } catch(e){}
+}
 function goPublic(){
   S.ownerSession = null;
+  save();
+  setPortal("public");
   startSplash("public");
   go("home");
 }
+function goOwnerPortal(){
+  setPortal("owner");
+  startSplash("owner");
+  go("admin");
+}
+function copyText(text, label){
+  const t = text || "";
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(()=>toast((label||"Link")+" copied")).catch(()=>prompt("Copy this link:", t));
+  } else {
+    prompt("Copy this link:", t);
+  }
+}
+function isPublicPortal(){ return portal !== "owner"; }
+function isOwnerPortal(){ return portal === "owner"; }
+
 function bottomItems(){
-  // Owner (authenticated) bottom tabs — simplified
-  if(isOwnerAuthed() && isAdminRoute(route)){
+  // Owner portal (private link #owner) — never mix with public customer tabs
+  if(isOwnerPortal()){
+    if(!isOwnerAuthed()) return []; // login screen only
     return [
       ["admin","Overview","📊"],
       on("ownerOrderQueue") && ["admin-orders","Orders","📋"],
@@ -1344,26 +1430,43 @@ function bottomItems(){
       (on("ownerShopSettings")||true) && ["admin-settings","Settings","⚙️"],
     ].filter(Boolean);
   }
-  // Public bottom tabs — Order larger & centered among Home · Order · Track
-  // (Owner entry is NOT in public bottom bar — only via discreet login path if needed)
-  const items = [
+  // Public portal — customers only (no Owner tab)
+  return [
     ["home","Home","🏠"],
     ["order","Order","🖨️", "tab-order"],
     on("customerOrderTracking") && ["track","Track","🔎"],
   ].filter(Boolean);
-  return items;
 }
 function render(){
   applyTheme();
   ensureHours();
-  // Hard lock: never render admin UI without auth
-  if(isAdminRoute(route) && !isOwnerAuthed()){
-    route = "admin"; // show login only
+  // Portal hard locks
+  if(isPublicPortal()){
+    // Customers can never see owner UI — strip admin routes
+    if(isAdminRoute(route)) route = "home";
+  } else {
+    // Owner portal: unauthenticated always login; authenticated stay in admin/*
+    if(!isOwnerAuthed()) route = "admin";
+    else if(!isAdminRoute(route)){
+      // Owner may preview public pages inside owner session via temporary switch only;
+      // default stay on admin when using owner URL
+      if(!["home","order","order-success","track"].includes(route)) route = "admin";
+    }
   }
   document.getElementById("brandName").textContent = S.settings.businessName || "PrintInk";
+  // Optional portal pill next to brand name area — update subtitle
+  try {
+    const sub = document.querySelector(".brand .muted");
+    if(sub){
+      sub.innerHTML = isOwnerPortal()
+        ? `Owner console <span class="portal-badge owner">Private</span>`
+        : `Ink-based print shop <span class="portal-badge public">Public</span>`;
+    }
+  } catch(e){}
   const pub = document.getElementById("publicBtn");
   if(pub){
-    if(isOwnerAuthed() && isAdminRoute(route)) pub.classList.add("show");
+    // Only on owner portal after login — jump to shareable public site
+    if(isOwnerPortal() && isOwnerAuthed()) pub.classList.add("show");
     else pub.classList.remove("show");
   }
   const nav=document.getElementById("bottomNav");
@@ -1386,10 +1489,20 @@ function render(){
   save();
 }
 function go(name, params={}){
-  // Public users cannot open admin routes at all (except login screen via explicit owner entry)
-  if(isAdminRoute(name) && !isOwnerAuthed() && name!=="admin"){
-    name = "admin";
+  // Public portal: block every admin route (no login page on customer link)
+  if(isPublicPortal() && isAdminRoute(name)){
+    toast("Owner console is on a private link");
+    name = "home";
     params = {};
+  }
+  // Owner portal: non-admin routes allowed only as "preview public" after auth
+  if(isOwnerPortal()){
+    if(!isOwnerAuthed()){
+      name = "admin";
+      params = {};
+    } else if(!isAdminRoute(name) && !["home","order","order-success","track"].includes(name)){
+      name = "admin";
+    }
   }
   route=name; routeParams=params;
   if(name==="order" && !orderDraft) resetDraft();
@@ -1438,8 +1551,8 @@ function viewHome(){
     </ul>
     <button class="btn primary" onclick="go('order')">Go to order form</button>
   </div>
-  <p class="muted" style="text-align:center;margin-top:28px;font-size:11px">
-    <a href="#" onclick="event.preventDefault();go('admin')" style="color:var(--muted);text-decoration:none;opacity:.55">Owner login</a>
+  <p class="muted" style="text-align:center;margin-top:28px;font-size:12px;line-height:1.5">
+    Customer portal only · orders go to the shop queue when placed on this device
   </p>`;
 }
 
@@ -1621,12 +1734,23 @@ function viewTrack(){
 function viewAdmin(){
   if(!S.ownerSession || !S.ownerSession.loggedIn){
     return `<div class="login-wrap"><div class="card dialog-card" style="width:min(420px,100%);padding:24px">
-      <div class="badge indigo">Private</div>
+      <div class="badge indigo">Private owner console</div>
       <h2 class="h2" style="margin-top:8px">Owner login</h2>
-      <p class="muted">Any name. PIN blank or <code>1234</code>.</p>
+      <p class="muted">This page is separate from the customer link. Customers cannot open this console from the public site.</p>
+      <p class="muted" style="margin-top:8px">Any name. PIN blank or <code>1234</code>.</p>
       <label class="field" style="margin-top:12px">Display name<input id="loginName" value="Owner"></label>
       <label class="field" style="margin-top:10px">PIN (optional)<input id="loginPin" type="password" placeholder="blank or 1234"></label>
       <button class="btn primary" style="width:100%;margin-top:14px" onclick="doLogin()">Enter dashboard</button>
+      <div class="share-box" style="margin-top:16px">
+        <b>Customer link</b> (share this only)
+        <code id="pubLinkHint">${esc(publicBaseUrl())}</code>
+        <div class="row">
+          <button type="button" class="btn sm" onclick="copyText(publicBaseUrl(),'Customer link')">Copy customer link</button>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:12px;font-size:11px;text-align:center">
+        Bookmark this owner URL for yourself:<br><span style="word-break:break-all">${esc(ownerBaseUrl())}</span>
+      </p>
     </div></div>`;
   }
   if(route==="admin") return adminOverview();
@@ -1646,7 +1770,28 @@ function adminOverview(){
   const today=localYMD(new Date());
   const pickups=S.orders.filter(o=>o.pickupAt&&o.pickupAt.startsWith(today)&&!["cancelled","picked_up"].includes(o.status));
   const revenue=S.orders.filter(o=>o.status!=="cancelled").reduce((s,o)=>s+o.total,0);
-  return `<div class="section-title"><div><h2 class="h2">Overview</h2><p class="muted">Hi, ${esc(S.ownerSession.name)} · use Public (top right) for the shareable site</p></div></div>
+  return `<div class="section-title"><div><h2 class="h2">Overview</h2><p class="muted">Hi, ${esc(S.ownerSession.name)} · private owner console</p></div></div>
+  <div class="share-box">
+    <b>🔗 Customer (public) link</b> — share with buyers. No owner tools on that page.
+    <code>${esc(publicBaseUrl())}</code>
+    <div class="row">
+      <button type="button" class="btn sm primary" onclick="copyText(publicBaseUrl(),'Customer link')">Copy customer link</button>
+      <button type="button" class="btn sm" onclick="goPublic()">Open public site</button>
+    </div>
+  </div>
+  <div class="share-box">
+    <b>🔒 Owner link</b> — bookmark on this XPad only. Do not post publicly.
+    <code>${esc(ownerBaseUrl())}</code>
+    <div class="row">
+      <button type="button" class="btn sm" onclick="copyText(ownerBaseUrl(),'Owner link')">Copy owner link</button>
+    </div>
+  </div>
+  <div class="device-note">
+    <b>Orders & devices:</b> With GitHub Pages only, orders are stored in <i>this browser on this device</i>.
+    If a customer orders on their own phone, that job stays on <i>their</i> phone unless you add a cloud server later.
+    <b>For the counter:</b> let customers place orders on this XPad (public site), then switch to the owner link to Accept/Decline — same tablet = same queue.
+  </div>
+
   <div class="grid 4">
     <div class="card stat accent-amber" style="cursor:pointer" onclick="go('admin-orders',{filter:'pending'})"><div class="l">Waiting accept</div><div class="v">${S.orders.filter(o=>o.status==='pending').length}</div></div>
     <div class="card stat accent-sky"><div class="l">In progress</div><div class="v">${open.filter(o=>o.status!=='pending').length}</div></div>
@@ -1911,7 +2056,9 @@ function doLogin(){
   const name=document.getElementById("loginName").value.trim()||"Owner";
   const pin=document.getElementById("loginPin").value;
   if(pin && pin!=="1234"){ toast("Wrong PIN (blank or 1234)"); return; }
+  setPortal("owner");
   S.ownerSession={loggedIn:true,name};
+  save();
   startSplash("owner");
   go("admin");
   toast("Welcome, "+name);
@@ -2190,10 +2337,39 @@ if ("serviceWorker" in navigator) {
   });
 }
 
-startSplash("public");
+// Portal from URL: #owner = private console, otherwise public customer site
+portal = readPortalFromLocation();
+setPortal(portal);
+if(isOwnerPortal()){
+  route = "admin";
+  startSplash("owner");
+} else {
+  // ensure no leftover owner session paint on public link
+  // (session still in storage but UI locked to public until #owner)
+  route = route && !isAdminRoute(route) ? route : "home";
+  if(isAdminRoute(route)) route = "home";
+  startSplash("public");
+}
+window.addEventListener("hashchange", function(){
+  const next = readPortalFromLocation();
+  if(next !== portal){
+    portal = next;
+    if(isOwnerPortal()){
+      startSplash("owner");
+      go(isOwnerAuthed() ? "admin" : "admin");
+    } else {
+      S.ownerSession = null;
+      save();
+      startSplash("public");
+      go("home");
+    }
+  }
+});
+
 // initial UI paint under splash
 applyTheme();
 render();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3fd9146baa909d0',t:'MTc5MDIwODY0MQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","spa":2}' crossorigin="anonymous"></script>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3fdb924a86fe2ee',t:'MTc5MDIxMDI3NA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
