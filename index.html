@@ -13,6 +13,7 @@
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
 <link rel="apple-touch-icon" href="apple-touch-icon.png" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root, [data-theme="light"] {
   --bg:#f1f5f9; --card:#fff; --ink:#0f172a; --muted:#64748b; --line:#e2e8f0;
@@ -697,6 +698,37 @@ td select, td .cdd-btn {
 .req-list .ok { color:var(--ok); font-weight:700; }
 .req-list .bad { color:var(--danger); }
 
+
+.remind-card {
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(245,158,11,.45);
+  background: linear-gradient(135deg, rgba(254,243,199,.85), rgba(253,230,138,.35));
+  box-shadow: 0 8px 24px rgba(245,158,11,.12);
+}
+[data-theme="dark"] .remind-card {
+  background: linear-gradient(135deg, rgba(120,53,15,.45), rgba(69,26,3,.35));
+  border-color: rgba(251,191,36,.35);
+}
+.remind-card h3 { margin: 0 0 6px; font-size: 15px; display:flex; align-items:center; gap:8px; }
+.remind-card p { margin: 0 0 10px; font-size: 13px; color: var(--ink); line-height: 1.45; opacity: .9; }
+.remind-card .row { flex-wrap: wrap; gap: 8px; }
+.cloud-card {
+  border: 1px solid rgba(14,165,233,.3);
+  background: linear-gradient(160deg, rgba(14,165,233,.08), rgba(79,70,229,.06));
+}
+.cloud-card h3 { margin: 0 0 6px; }
+.cloud-status {
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:11px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
+  padding:4px 10px; border-radius:999px;
+}
+.cloud-status.on { background:rgba(16,185,129,.18); color:#059669; }
+.cloud-status.off { background:rgba(100,116,139,.15); color:#64748b; }
+.cloud-status.err { background:rgba(225,29,72,.15); color:#e11d48; }
+.cloud-status.sync { background:rgba(14,165,233,.15); color:#0284c8; }
+
 </style>
 </head>
 <body>
@@ -1064,7 +1096,7 @@ function defaultSettings(){
     hours:[day(0,"10:00","16:00",true),day(1,"09:00","18:00"),day(2,"09:00","18:00"),day(3,"09:00","18:00"),day(4,"09:00","18:00"),day(5,"09:00","18:00"),day(6,"09:00","17:00")],
     blackoutDates:[], fileRetentionDays:30 };
 }
-function seed(){ return { features:{...DEFAULT_FEATURES}, settings:defaultSettings(), papers:defaultPapers(), inks:defaultInks(), fees:defaultFees(), orders:[], activity:[], monthlySummaries:[], auth: defaultAuth(), ownerSession:null, theme:"light" }; }
+function seed(){ return { features:{...DEFAULT_FEATURES}, settings:defaultSettings(), papers:defaultPapers(), inks:defaultInks(), fees:defaultFees(), orders:[], activity:[], monthlySummaries:[], auth: defaultAuth(), cloud: defaultCloud(), ownerSession:null, theme:"light" }; }
 function load(){
   try{
     const raw=localStorage.getItem(STORAGE_KEY);
@@ -1073,6 +1105,7 @@ function load(){
     p.features={...DEFAULT_FEATURES,...(p.features||{})};
     if(!Array.isArray(p.monthlySummaries)) p.monthlySummaries=[];
     p.auth = ensureAuth(p.auth);
+    p.cloud = ensureCloud(p.cloud);
 
     p.orders=p.orders||[]; p.activity=(p.activity||[]).filter(a=>a && a.kind==="job");
     p.theme=p.theme||"light";
@@ -1491,9 +1524,10 @@ async function doLogin(){
   setPortal("owner");
   S.ownerSession = { loggedIn:true, name };
   save();
-  startSplash("owner");
+  // No second splash after password — go straight into dashboard
   go("admin");
-  toast("Welcome, " + name + (S.auth.passwordChanged ? "" : " \u2014 please change the demo password"));
+  toast("Welcome, " + name + (S.auth.passwordChanged ? "" : " — please change the demo password"));
+  if(cloudConfigured()) cloudConnect();
 }
 async function doForgotReset(){
   await bootstrapAuthIfNeeded();
@@ -1613,14 +1647,365 @@ async function clearRecoveryKey(){
 }
 
 
+
+/* ===== Month-close auto-remind ===== */
+function prevMonthKey(fromKey){
+  const cur = fromKey || currentMonthKey();
+  let y = Number(cur.slice(0,4)), m = Number(cur.slice(5,7));
+  m -= 1;
+  if(m < 1){ m = 12; y -= 1; }
+  return y + "-" + String(m).padStart(2,"0");
+}
+function monthsNeedingClose(){
+  ensureSummaries();
+  const closed = new Set((S.monthlySummaries||[]).map(s => s.month));
+  const cur = currentMonthKey();
+  const day = new Date().getDate();
+  const map = {};
+  (S.orders||[]).forEach(o => {
+    const k = orderMonthKey(o);
+    if(!map[k]) map[k] = [];
+    map[k].push(o);
+  });
+  const out = [];
+  Object.keys(map).forEach(k => {
+    if(closed.has(k)) return;
+    const n = map[k].length;
+    if(!n) return;
+    // Past months with orders always remind
+    if(k < cur){
+      out.push({ month:k, label:monthLabel(k), count:n, kind:"past" });
+      return;
+    }
+    // Current month: soft remind from day 25+
+    if(k === cur && day >= 25){
+      out.push({ month:k, label:monthLabel(k), count:n, kind:"current" });
+    }
+  });
+  // Also: previous calendar month with no orders but never closed? skip
+  // Prefer past months first
+  out.sort((a,b) => a.month < b.month ? -1 : 1);
+  return out;
+}
+function monthRemindHtml(){
+  if(typeof currentMonthKey !== "function" || typeof monthLabel !== "function") return "";
+  const items = monthsNeedingClose();
+  if(!items.length) return "";
+  const past = items.filter(i => i.kind === "past");
+  const soft = items.filter(i => i.kind === "current");
+  const primary = past[0] || soft[0];
+  const title = past.length
+    ? (past.length === 1
+        ? (primary.label + " not closed yet")
+        : (past.length + " months not closed yet"))
+    : (primary.label + " — close soon");
+  const detail = past.length
+    ? past.map(i => i.label + " (" + i.count + " order" + (i.count===1?"":"s") + ")").join(" · ")
+      + " — save the monthly summary, then delete those orders."
+    : (primary.label + " has " + primary.count + " order(s). After month-end, close it in Reports.");
+  return `<div class="remind-card" role="status">
+    <h3>⏰ ${esc(title)}</h3>
+    <p>${esc(detail)}</p>
+    <div class="row">
+      <button type="button" class="btn sm primary" onclick="go('admin-reports',{month:'${primary.month}'})">Open Reports · ${esc(primary.label)}</button>
+      ${past.length > 1 ? `<button type="button" class="btn sm" onclick="go('admin-reports')">All months</button>` : ""}
+    </div>
+  </div>`;
+}
+
+/* ===== Optional Supabase cloud (shared orders across devices) ===== */
+function defaultCloud(){
+  return {
+    enabled: false,
+    url: "",
+    anonKey: "",
+    shopId: "main",
+    lastSyncAt: null,
+    lastError: null,
+    status: "off", // off | ready | syncing | error
+  };
+}
+function ensureCloud(c){
+  const d = defaultCloud();
+  if(!c || typeof c !== "object") return { ...d };
+  return { ...d, ...c };
+}
+let __sb = null;
+let __sbChan = null;
+let __cloudTimer = null;
+
+function cloudConfigured(){
+  S.cloud = ensureCloud(S.cloud);
+  return !!(S.cloud.enabled && S.cloud.url && S.cloud.anonKey);
+}
+function cloudStatusLabel(){
+  S.cloud = ensureCloud(S.cloud);
+  if(!S.cloud.enabled) return { cls:"off", text:"Local only" };
+  if(S.cloud.status === "syncing") return { cls:"sync", text:"Syncing…" };
+  if(S.cloud.status === "error") return { cls:"err", text:"Cloud error" };
+  if(S.cloud.status === "ready") return { cls:"on", text:"Cloud on" };
+  return { cls:"off", text:"Cloud off" };
+}
+function getSupabase(){
+  if(!cloudConfigured()) return null;
+  if(typeof supabase === "undefined" || !supabase.createClient){
+    S.cloud.lastError = "Supabase library not loaded";
+    S.cloud.status = "error";
+    return null;
+  }
+  try {
+    if(!__sb){
+      __sb = supabase.createClient(S.cloud.url.trim(), S.cloud.anonKey.trim(), {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+    }
+    return __sb;
+  } catch(e){
+    S.cloud.lastError = String(e && e.message || e);
+    S.cloud.status = "error";
+    return null;
+  }
+}
+function resetSupabaseClient(){
+  try { if(__sbChan){ __sb.removeChannel(__sbChan); } } catch(e){}
+  __sbChan = null;
+  __sb = null;
+}
+function orderToRow(o){
+  return {
+    id: o.id,
+    shop_id: (S.cloud && S.cloud.shopId) || "main",
+    code: o.code,
+    payload: o,
+    status: o.status,
+    updated_at: o.updatedAt || o.createdAt || new Date().toISOString(),
+  };
+}
+function rowToOrder(row){
+  if(row && row.payload && typeof row.payload === "object") return row.payload;
+  return null;
+}
+function mergeOrdersFromCloud(remoteList){
+  const byId = {};
+  (S.orders || []).forEach(o => { byId[o.id] = o; });
+  (remoteList || []).forEach(row => {
+    const o = rowToOrder(row);
+    if(!o || !o.id) return;
+    const local = byId[o.id];
+    if(!local){ byId[o.id] = o; return; }
+    const lt = new Date(local.updatedAt || local.createdAt || 0).getTime();
+    const rt = new Date(o.updatedAt || o.createdAt || row.updated_at || 0).getTime();
+    if(rt >= lt) byId[o.id] = o;
+  });
+  S.orders = Object.values(byId).sort((a,b) =>
+    new Date(b.createdAt||0) - new Date(a.createdAt||0)
+  );
+}
+async function cloudPullOrders(){
+  const sb = getSupabase();
+  if(!sb) return false;
+  S.cloud.status = "syncing";
+  try {
+    const shop = (S.cloud.shopId || "main");
+    const { data, error } = await sb.from("orders")
+      .select("id,code,payload,status,updated_at,shop_id")
+      .eq("shop_id", shop)
+      .order("updated_at", { ascending: false })
+      .limit(500);
+    if(error) throw error;
+    mergeOrdersFromCloud(data || []);
+    S.cloud.lastSyncAt = new Date().toISOString();
+    S.cloud.lastError = null;
+    S.cloud.status = "ready";
+    save();
+    return true;
+  } catch(e){
+    S.cloud.lastError = String(e && e.message || e);
+    S.cloud.status = "error";
+    save();
+    return false;
+  }
+}
+async function cloudUpsertOrder(order){
+  if(!cloudConfigured() || !order) return;
+  const sb = getSupabase();
+  if(!sb) return;
+  try {
+    // Strip heavy previews to keep rows smaller
+    const slim = JSON.parse(JSON.stringify(order));
+    (slim.items || []).forEach(it => {
+      (it.files || []).forEach(f => { if(f && f.previewUrl) f.previewUrl = null; });
+    });
+    const row = orderToRow(slim);
+    const { error } = await sb.from("orders").upsert(row, { onConflict: "id" });
+    if(error) throw error;
+    S.cloud.lastSyncAt = new Date().toISOString();
+    S.cloud.lastError = null;
+    if(S.cloud.status !== "syncing") S.cloud.status = "ready";
+  } catch(e){
+    S.cloud.lastError = String(e && e.message || e);
+    S.cloud.status = "error";
+  }
+}
+async function cloudDeleteOrderIds(ids){
+  if(!cloudConfigured() || !ids || !ids.length) return;
+  const sb = getSupabase();
+  if(!sb) return;
+  try {
+    const { error } = await sb.from("orders").delete().in("id", ids);
+    if(error) throw error;
+  } catch(e){
+    S.cloud.lastError = String(e && e.message || e);
+    S.cloud.status = "error";
+  }
+}
+function cloudSubscribe(){
+  const sb = getSupabase();
+  if(!sb || !cloudConfigured()) return;
+  try {
+    if(__sbChan){ sb.removeChannel(__sbChan); __sbChan = null; }
+    const shop = S.cloud.shopId || "main";
+    __sbChan = sb.channel("orders-" + shop)
+      .on("postgres_changes", {
+        event: "*",
+        schema: "public",
+        table: "orders",
+        filter: "shop_id=eq." + shop,
+      }, function(){
+        cloudPullOrders().then(function(ok){ if(ok) render(); });
+      })
+      .subscribe();
+  } catch(e){
+    S.cloud.lastError = String(e && e.message || e);
+  }
+}
+async function cloudConnect(){
+  S.cloud = ensureCloud(S.cloud);
+  resetSupabaseClient();
+  if(!cloudConfigured()){
+    S.cloud.status = "off";
+    save();
+    toast("Cloud disabled or missing URL/key");
+    render();
+    return;
+  }
+  S.cloud.status = "syncing";
+  save(); render();
+  const ok = await cloudPullOrders();
+  if(ok){
+    cloudSubscribe();
+    toast("Cloud connected — orders sync");
+  } else {
+    toast("Cloud error: " + (S.cloud.lastError || "check URL/key/table"));
+  }
+  render();
+}
+function cloudDisconnect(){
+  S.cloud = ensureCloud(S.cloud);
+  S.cloud.enabled = false;
+  S.cloud.status = "off";
+  resetSupabaseClient();
+  save();
+  toast("Cloud off — local device only");
+  render();
+}
+function saveCloudSettingsFromForm(){
+  S.cloud = ensureCloud(S.cloud);
+  const url = (document.getElementById("cloudUrl")||{}).value || "";
+  const key = (document.getElementById("cloudKey")||{}).value || "";
+  const shop = (document.getElementById("cloudShop")||{}).value || "main";
+  const en = !!(document.getElementById("cloudEnabled")||{}).checked;
+  S.cloud.url = url.trim();
+  S.cloud.anonKey = key.trim();
+  S.cloud.shopId = (shop.trim() || "main");
+  S.cloud.enabled = en;
+  resetSupabaseClient();
+  save();
+  if(en) cloudConnect();
+  else {
+    S.cloud.status = "off";
+    save();
+    toast("Cloud settings saved");
+    render();
+  }
+}
+function startCloudPoll(){
+  if(__cloudTimer) clearInterval(__cloudTimer);
+  __cloudTimer = setInterval(function(){
+    if(!cloudConfigured()) return;
+    if(document.hidden) return;
+    cloudPullOrders().then(function(ok){
+      if(ok && isOwnerAuthed && isOwnerAuthed() && isOwnerPortal && isOwnerPortal()){
+        // soft refresh if on orders views
+        if(route && String(route).indexOf("admin") === 0) render();
+      }
+    });
+  }, 45000);
+}
+function cloudPanelHtml(){
+  S.cloud = ensureCloud(S.cloud);
+  const st = cloudStatusLabel();
+  return `<div class="card cloud-card" style="margin-top:14px">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h3>☁️ Cloud sync (optional)</h3>
+      <span class="cloud-status ${st.cls}">${esc(st.text)}</span>
+    </div>
+    <p class="muted" style="font-size:12px;margin:0 0 10px;line-height:1.45">
+      Free <b>Supabase</b> project so customer phones and this XPad share the <b>same order list</b>.
+      Without cloud, orders stay only on each device.
+    </p>
+    <label class="field" style="flex-direction:row;align-items:center;gap:10px;display:flex">
+      <input type="checkbox" id="cloudEnabled" ${S.cloud.enabled?"checked":""} style="width:auto">
+      <span>Enable cloud sync</span>
+    </label>
+    <label class="field" style="margin-top:8px">Supabase project URL
+      <input id="cloudUrl" placeholder="https://xxxx.supabase.co" value="${esc(S.cloud.url||"")}" autocomplete="off">
+    </label>
+    <label class="field" style="margin-top:8px">Anon public key
+      <input id="cloudKey" type="password" placeholder="eyJhbGciOi..." value="${esc(S.cloud.anonKey||"")}" autocomplete="off">
+    </label>
+    <label class="field" style="margin-top:8px">Shop ID
+      <input id="cloudShop" value="${esc(S.cloud.shopId||"main")}" placeholder="main">
+    </label>
+    <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:8px">
+      <button type="button" class="btn sm primary" onclick="saveCloudSettingsFromForm()">Save & connect</button>
+      <button type="button" class="btn sm" onclick="cloudConnect()">Sync now</button>
+      <button type="button" class="btn sm ghost" onclick="cloudDisconnect()">Turn off</button>
+    </div>
+    ${S.cloud.lastSyncAt ? `<p class="muted" style="font-size:11px;margin:10px 0 0">Last sync: ${esc(fmtDT(S.cloud.lastSyncAt))}</p>` : ""}
+    ${S.cloud.lastError ? `<p style="font-size:12px;color:var(--danger);margin:8px 0 0">${esc(S.cloud.lastError)}</p>` : ""}
+    <div class="device-note" style="margin-top:12px">
+      <b>One-time setup:</b> create free project at supabase.com → SQL Editor → run the PrintInk orders table SQL
+      (Settings shows the snippet below) → Project Settings → API → copy URL + <code>anon</code> key here.
+      Enable Row Level Security policies that allow insert/select/update/delete for <code>anon</code> on this shop table
+      (fine for a private shop link; use a random shop ID).
+    </div>
+    <details style="margin-top:10px">
+      <summary style="cursor:pointer;font-weight:700;font-size:13px">SQL to create table</summary>
+      <pre style="white-space:pre-wrap;font-size:11px;background:var(--soft);padding:10px;border-radius:10px;margin-top:8px;border:1px solid var(--line)">create table if not exists orders (
+  id text primary key,
+  shop_id text not null default 'main',
+  code text,
+  status text,
+  payload jsonb not null,
+  updated_at timestamptz default now()
+);
+create index if not exists orders_shop_updated on orders (shop_id, updated_at desc);
+
+alter table orders enable row level security;
+create policy "printink_all" on orders for all using (true) with check (true);</pre>
+    </details>
+  </div>`;
+}
+
+
 function isOwnerAuthed(){ return !!(S.ownerSession && S.ownerSession.loggedIn); }
 function isAdminRoute(name){ return String(name||"").startsWith("admin"); }
 
-/** portal: "public" = customer site only | "owner" = private console (+ can open public) */
-let portal = "public";
+/** portal: default bare URL = OWNER | customer share link = #public */
+let portal = "owner";
 
-function publicBaseUrl(){
-  // Shareable customer link (no #owner)
+function siteRootUrl(){
   try {
     const u = new URL(location.href);
     u.hash = "";
@@ -1630,27 +2015,36 @@ function publicBaseUrl(){
     return s;
   } catch(e){ return location.href.split("#")[0]; }
 }
+function publicBaseUrl(){
+  // Share with customers ONLY — public portal
+  const base = siteRootUrl();
+  return base + (base.endsWith("/") ? "" : "/") + "#public";
+}
 function ownerBaseUrl(){
-  const base = publicBaseUrl();
-  return base + (base.endsWith("/") ? "" : "/") + "#owner";
+  // Main app / home screen / index.html — owner console (password after splash)
+  return siteRootUrl();
 }
 function readPortalFromLocation(){
-  const h = (location.hash || "").replace(/^#/, "").toLowerCase();
-  // #owner | #/owner | #owner/orders etc.
-  if(h === "owner" || h.startsWith("owner/") || h.startsWith("/owner")) return "owner";
-  return "public";
+  const h = (location.hash || "").replace(/^#\/?/, "").toLowerCase();
+  // Customer portal only when explicitly #public
+  if(h === "public" || h.startsWith("public/") || h.startsWith("public?")) return "public";
+  // Bare URL, #owner, empty, or anything else → owner console
+  return "owner";
 }
 function setPortal(mode, opts){
   opts = opts || {};
   portal = (mode === "owner") ? "owner" : "public";
   try {
-    if(portal === "owner"){
-      if((location.hash || "").replace(/^#/,"").toLowerCase().indexOf("owner") !== 0){
-        history.replaceState(null, "", location.pathname + location.search + "#owner");
+    const path = location.pathname + location.search;
+    if(portal === "public"){
+      if((location.hash || "").replace(/^#\/?/,"").toLowerCase().indexOf("public") !== 0){
+        history.replaceState(null, "", path + "#public");
       }
     } else if(!opts.keepHash){
-      if((location.hash || "").toLowerCase().indexOf("owner") >= 0){
-        history.replaceState(null, "", location.pathname + location.search);
+      // Owner: clean URL (no #public). #owner optional.
+      const h = (location.hash || "").replace(/^#\/?/,"").toLowerCase();
+      if(h.indexOf("public") === 0){
+        history.replaceState(null, "", path);
       }
     }
   } catch(e){}
@@ -1663,6 +2057,9 @@ function goPublic(){
   go("home");
 }
 function goOwnerPortal(){
+  // Always require password after splash — never reuse old session quietly
+  S.ownerSession = null;
+  save();
   setPortal("owner");
   startSplash("owner");
   go("admin");
@@ -2027,16 +2424,6 @@ function viewAdmin(){
         `}
       </div>
 
-      <div class="share-box" style="margin-top:16px">
-        <b>Customer link</b> (share this only)
-        <code id="pubLinkHint">${esc(publicBaseUrl())}</code>
-        <div class="row">
-          <button type="button" class="btn sm" onclick="copyText(publicBaseUrl(),'Customer link')">Copy customer link</button>
-        </div>
-      </div>
-      <p class="muted" style="margin-top:12px;font-size:11px;text-align:center">
-        Owner URL (bookmark):<br><span style="word-break:break-all">${esc(ownerBaseUrl())}</span>
-      </p>
     </div></div>`;
   }
   if(route==="admin") return adminOverview();
@@ -2056,9 +2443,12 @@ function adminOverview(){
   const today=localYMD(new Date());
   const pickups=S.orders.filter(o=>o.pickupAt&&o.pickupAt.startsWith(today)&&!["cancelled","picked_up"].includes(o.status));
   const revenue=S.orders.filter(o=>o.status!=="cancelled").reduce((s,o)=>s+o.total,0);
+  S.cloud = ensureCloud(S.cloud);
+  const cst = cloudStatusLabel();
   return `<div class="section-title"><div><h2 class="h2">Overview</h2><p class="muted">Hi, ${esc(S.ownerSession.name)} · private owner console</p></div></div>
+  ${monthRemindHtml()}
   <div class="share-box">
-    <b>🔗 Customer (public) link</b> — share with buyers. No owner tools on that page.
+    <b>🔗 Customer link</b> — send this to buyers only (<code>#public</code>). No owner tools.
     <code>${esc(publicBaseUrl())}</code>
     <div class="row">
       <button type="button" class="btn sm primary" onclick="copyText(publicBaseUrl(),'Customer link')">Copy customer link</button>
@@ -2066,16 +2456,31 @@ function adminOverview(){
     </div>
   </div>
   <div class="share-box">
-    <b>🔒 Owner link</b> — bookmark on this XPad only. Do not post publicly.
+    <b>🔒 Owner / main app</b> — open <code>index.html</code> or this link on the XPad (password after load). Do not send to customers.
     <code>${esc(ownerBaseUrl())}</code>
     <div class="row">
       <button type="button" class="btn sm" onclick="copyText(ownerBaseUrl(),'Owner link')">Copy owner link</button>
     </div>
   </div>
+  <div class="share-box" style="border-style:solid">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <b>☁️ Cloud</b>
+      <span class="cloud-status ${cst.cls}">${esc(cst.text)}</span>
+    </div>
+    <p class="muted" style="font-size:12px;margin:8px 0 0;line-height:1.45">
+      ${cloudConfigured()
+        ? ("Shared queue " + (S.cloud.lastSyncAt ? ("· last sync " + fmtDT(S.cloud.lastSyncAt)) : "· connect in Settings"))
+        : "Local device only — enable Supabase in Settings so phones feed this XPad."}
+    </p>
+    <div class="row" style="margin-top:8px">
+      ${cloudConfigured() ? `<button type="button" class="btn sm" onclick="cloudConnect()">Sync now</button>` : ""}
+      <button type="button" class="btn sm" onclick="go('admin-settings')">Cloud settings</button>
+    </div>
+  </div>
   <div class="device-note">
-    <b>Orders & devices:</b> With GitHub Pages only, orders are stored in <i>this browser on this device</i>.
-    If a customer orders on their own phone, that job stays on <i>their</i> phone unless you add a cloud server later.
-    <b>For the counter:</b> let customers place orders on this XPad (public site), then switch to the owner link to Accept/Decline — same tablet = same queue.
+    <b>Orders & devices:</b> Without cloud, orders stay in <i>this browser</i>.
+    With cloud enabled, customer phones and this XPad share one queue.
+    <b>Counter tip:</b> public site for orders · owner link + password for Accept/Decline.
   </div>
 
   <div class="grid 4">
@@ -2400,6 +2805,7 @@ function closeMonthAndDelete(ym){
   S.monthlySummaries = S.monthlySummaries.slice(0, 60); // keep ~5 years
   const ids = new Set(monthOrders.map(o => o.id));
   S.orders = (S.orders||[]).filter(o => !ids.has(o.id));
+  cloudDeleteOrderIds([...ids]);
   logJob("Closed month " + ym + " — summary saved, " + monthOrders.length + " orders deleted", { month: ym, revenue: stats.revenue, deleted: monthOrders.length });
   save();
   toast(monthLabel(ym) + " closed · " + monthOrders.length + " orders removed");
@@ -2551,7 +2957,7 @@ function adminSettings(){
   S.auth = ensureAuth(S.auth);
   const s=S.settings;
   return `<div class="section-title"><div><h2 class="h2">Settings</h2><p class="muted">Shop setup & tools</p></div>
-    <button type="button" class="btn sm" onclick="S.ownerSession=null;go('home')">Log out</button></div>
+    <button type="button" class="btn sm" onclick="S.ownerSession=null;save();setPortal('public');go('home')">Log out</button></div>
 
   <div class="settings-hub">
     ${on("ownerPriceEditor")?`<button type="button" class="hub-btn" onclick="go('admin-pricing')"><div><div>💧 Pricing</div><div class="sub">Paper, ink rates & fees</div></div><span>›</span></button>`:""}
@@ -2613,6 +3019,8 @@ function adminSettings(){
       ${S.auth && S.auth.recoverySet ? `<button type="button" class="btn sm danger" onclick="clearRecoveryKey()">Remove recovery key</button>` : ""}
     </div>
   </div>
+
+  ${cloudPanelHtml()}
 
   <div class="card" style="margin-top:14px"><b>Data</b>
     <div class="row" style="margin-top:8px">
@@ -2714,7 +3122,7 @@ function setOrderStatus(id, status){
   }
   const from=o.status; o.status=status; o.updatedAt=new Date().toISOString();
   logJob(`Job ${o.code}: ${from} → ${status}${status==="ready"&&on("smsNotifications")?" (SMS simulated)":""}`, {code:o.code, from, to:status});
-  save(); render(); toast("Status updated");
+  save(); cloudUpsertOrder(o); render(); toast("Status updated");
 }
 function acceptOrder(id){
   const o=S.orders.find(x=>x.id===id); if(!o) return;
@@ -2724,7 +3132,7 @@ function acceptOrder(id){
   o.updatedAt=new Date().toISOString();
   o.acceptedAt=new Date().toISOString();
   logJob(`Job ${o.code}: accepted by owner`, {code:o.code, from, to:"received"});
-  save(); render(); toast("Order accepted");
+  save(); cloudUpsertOrder(o); render(); toast("Order accepted");
 }
 function declineOrder(id){
   const o=S.orders.find(x=>x.id===id); if(!o) return;
@@ -2735,7 +3143,7 @@ function declineOrder(id){
   o.updatedAt=new Date().toISOString();
   o.declinedAt=new Date().toISOString();
   logJob(`Job ${o.code}: declined by owner`, {code:o.code, from, to:"declined"});
-  save(); render(); toast("Order declined");
+  save(); cloudUpsertOrder(o); render(); toast("Order declined");
 }
 function editItem(orderId, itemId, patch){
   const o=S.orders.find(x=>x.id===orderId); if(!o) return;
@@ -2744,7 +3152,7 @@ function editItem(orderId, itemId, patch){
   const q=quoteLine(it); it.lineTotal=q.lineTotal; it.breakdown={paper:q.paper,ink:q.ink,pagesEffective:q.pagesEffective};
   const oq=quoteOrder(o.items, o.rush); o.subtotal=oq.subtotal; o.rushFee=oq.rushFee; o.otherFees=oq.otherFees; o.total=oq.total;
   o.updatedAt=new Date().toISOString();
-  logJob(`Job ${o.code} specs edited`, {code:o.code, patch}); render();
+  logJob(`Job ${o.code} specs edited`, {code:o.code, patch}); save(); cloudUpsertOrder(o); render();
 }
 function updatePaper(id, patch){ const p=S.papers.find(x=>x.id===id); if(!p) return; Object.assign(p,patch); render(); }
 function updateInk(id, patch){ const p=S.inks.find(x=>x.id===id); if(!p) return; Object.assign(p,patch); render(); }
@@ -2782,7 +3190,7 @@ function exportData(){ const a=document.createElement("a"); a.href=URL.createObj
 function importData(ev){
   const file=ev.target.files&&ev.target.files[0]; if(!file) return;
   const reader=new FileReader();
-  reader.onload=()=>{ try{ const p=JSON.parse(reader.result); p.features={...DEFAULT_FEATURES,...(p.features||{})}; p.activity=(p.activity||[]).filter(a=>a&&a.kind==="job"); p.auth=ensureAuth(p.auth); if(!Array.isArray(p.monthlySummaries)) p.monthlySummaries=[]; S=p; orderDraft=null; applyTheme(); render(); toast("Imported"); }catch(e){ toast("Invalid JSON"); } };
+  reader.onload=()=>{ try{ const p=JSON.parse(reader.result); p.features={...DEFAULT_FEATURES,...(p.features||{})}; p.activity=(p.activity||[]).filter(a=>a&&a.kind==="job"); p.auth=ensureAuth(p.auth); p.cloud=ensureCloud(p.cloud); if(!Array.isArray(p.monthlySummaries)) p.monthlySummaries=[]; S=p; orderDraft=null; applyTheme(); render(); toast("Imported"); }catch(e){ toast("Invalid JSON"); } };
   reader.readAsText(file);
 }
 
@@ -2886,6 +3294,15 @@ function finishSplash(force){
   setTimeout(()=>{
     if(splash){ splash.classList.add("hide"); splash.setAttribute("aria-busy","false"); }
     if(app){ app.classList.remove("is-booting"); app.classList.add("boot-ready"); }
+    // Owner console: after loading screen, password is required before dashboard
+    if(typeof isOwnerPortal === "function" && isOwnerPortal()){
+      if(!isOwnerAuthed()){
+        S.ownerSession = null;
+        route = "admin";
+        routeParams = {};
+        render();
+      }
+    }
   }, 280);
 }
 
@@ -2899,16 +3316,19 @@ if ("serviceWorker" in navigator) {
 }
 
 bootstrapAuthIfNeeded().catch(function(){});
+try { startCloudPoll(); } catch(e){}
+try { if(typeof cloudConfigured === "function" && cloudConfigured()) cloudConnect(); } catch(e){}
 
-// Portal from URL: #owner = private console, otherwise public customer site
+// Portal: bare URL / #owner = owner console; #public = customer site only
 portal = readPortalFromLocation();
 setPortal(portal);
 if(isOwnerPortal()){
+  // Require password every time owner portal is opened (after splash → login)
+  S.ownerSession = null;
   route = "admin";
   startSplash("owner");
 } else {
-  // ensure no leftover owner session paint on public link
-  // (session still in storage but UI locked to public until #owner)
+  // Public link (#public): customer UI only
   route = route && !isAdminRoute(route) ? route : "home";
   if(isAdminRoute(route)) route = "home";
   startSplash("public");
@@ -2918,8 +3338,10 @@ window.addEventListener("hashchange", function(){
   if(next !== portal){
     portal = next;
     if(isOwnerPortal()){
+      S.ownerSession = null;
+      save();
       startSplash("owner");
-      go(isOwnerAuthed() ? "admin" : "admin");
+      go("admin");
     } else {
       S.ownerSession = null;
       save();
@@ -2933,6 +3355,5 @@ window.addEventListener("hashchange", function(){
 applyTheme();
 render();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3fe60f9eb906131',t:'MTc5MDIxNzE0OA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","spa":2}' crossorigin="anonymous"></script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3feb4d4ffda0946',t:'MTc5MDIyMDU4Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
